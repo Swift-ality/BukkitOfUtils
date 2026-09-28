@@ -45,11 +45,51 @@ public class EntityUtils {
      * @param cachedEntities the entity cache to set
      * @return the entity cache
      */
-    @Getter @Setter
+    @Setter
     private static Cache<String, WeakReference<Entity>> cachedEntities = Caffeine.newBuilder()
             .expireAfterWrite(Duration.ofSeconds(1))
             .build()
             ;
+
+    /**
+     * How long the cache is kept refreshed on non-Folia servers after it was last read.
+     * On Paper/Spigot nothing inside BukkitOfUtils reads the cache, so refreshing it
+     * unconditionally meant a full main-thread entity scan every collection period for no reader
+     * (~5.5 ms every 0.5 s in a 71-minute production spark profile).
+     */
+    private static final long CACHE_IDLE_MILLIS = 30_000L;
+
+    /**
+     * The last time (epoch millis) the entity cache was read.
+     */
+    private static volatile long lastCacheRead = 0L;
+
+    /**
+     * Gets the cache of entities indexed by their UUID string, and marks the cache as in use
+     * so the lookup timer keeps it refreshed.
+     *
+     * @return the entity cache
+     */
+    public static Cache<String, WeakReference<Entity>> getCachedEntities() {
+        markCacheRead();
+        return cachedEntities;
+    }
+
+    /**
+     * Marks the entity cache as recently read.
+     */
+    private static void markCacheRead() {
+        lastCacheRead = System.currentTimeMillis();
+    }
+
+    /**
+     * Whether the entity cache has been read within {@link #CACHE_IDLE_MILLIS}.
+     *
+     * @return true if something is using the cache
+     */
+    public static boolean isCacheInUse() {
+        return System.currentTimeMillis() - lastCacheRead <= CACHE_IDLE_MILLIS;
+    }
 
     /**
      * The periodic timer responsible for refreshing the entity cache.
@@ -74,7 +114,7 @@ public class EntityUtils {
      * @return true if the entity is in the cache
      */
     public static boolean containsValue(Entity entity) {
-        return cachedEntities.asMap().containsValue(entity);
+        return getCachedEntities().asMap().containsValue(entity);
     }
 
     /**
@@ -84,7 +124,7 @@ public class EntityUtils {
      * @return true if an entry with the given UUID exists in the cache
      */
     public static boolean containsKey(String uniqueId) {
-        return cachedEntities.asMap().containsKey(uniqueId);
+        return getCachedEntities().asMap().containsKey(uniqueId);
     }
 
     /**
@@ -94,11 +134,12 @@ public class EntityUtils {
      * @param entity a weak reference to the entity to cache
      */
     public static void cacheEntityAlreadyInSync(WeakReference<Entity> entity) {
-        if (entity == null || entity.get() == null) return;
-        if (! entity.get().isValid()) return;
-        if (containsKey(entity.get().getUniqueId().toString())) return;
+        Entity e = entity == null ? null : entity.get();
+        if (e == null) return;
+        if (! e.isValid()) return;
 
-        cachedEntities.put(entity.get().getUniqueId().toString(), entity);
+        // putIfAbsent instead of containsKey + put: one lookup and one UUID string instead of three.
+        cachedEntities.asMap().putIfAbsent(e.getUniqueId().toString(), entity);
     }
 
     /**
@@ -128,7 +169,11 @@ public class EntityUtils {
      * Clears the entity cache and re-collects all entities from loaded worlds.
      */
     public static void tickCache() {
-        clearCache();
+        if (ClassHelper.isFolia()) {
+            clearCache();
+        }
+        // On non-Folia the cache is cleared and refilled inside the same main-thread task
+        // (see collectEntities), so async readers never observe an empty cache in between.
         collectEntities();
     }
 
@@ -182,7 +227,16 @@ public class EntityUtils {
                 }
             } else {
                 TaskManager.runTask(() -> {
-                    getEntitiesBukkit().values().forEach(EntityUtils::cacheEntity);
+                    // Single pass straight into a HashMap: no sorted ConcurrentSkipListMap, no repeated
+                    // UUID.toString(), and no isValid()/containsKey() on entities the world just returned.
+                    Map<String, WeakReference<Entity>> fresh = new HashMap<>();
+                    for (World world : Bukkit.getWorlds()) {
+                        for (Entity entity : world.getEntities()) {
+                            fresh.put(entity.getUniqueId().toString(), new WeakReference<>(entity));
+                        }
+                    }
+                    cachedEntities.invalidateAll();
+                    cachedEntities.putAll(fresh);
                 });
             }
         } catch (Exception e) {
@@ -277,9 +331,12 @@ public class EntityUtils {
     public static void collectLivingEntitiesThenDo(Consumer<LivingEntity> consumer) {
         TaskManager.runTask(() -> {
             getEntities(true).forEach((s, entity) -> {
-                TaskManager.runTask(entity.get(), () -> {
-                    if (entity instanceof LivingEntity) {
-                        consumer.accept((LivingEntity) entity);
+                Entity e = entity.get();
+                if (e == null) return;
+                TaskManager.runTask(e, () -> {
+                    // Was `entity instanceof LivingEntity`, which tested the WeakReference and was always false.
+                    if (e instanceof LivingEntity) {
+                        consumer.accept((LivingEntity) e);
                     }
                 });
             });
@@ -375,7 +432,8 @@ public class EntityUtils {
             try {
                 if (isCancelled()) return;
 
-                tickCache();
+                // On non-Folia nothing in BukkitOfUtils reads the cache; only refresh it while someone uses it.
+                if (ClassHelper.isFolia() || isCacheInUse()) tickCache();
                 if (getPeriod() != BaseManager.getBaseConfig().getEntityCollectionFrequency()) setPeriod(BaseManager.getBaseConfig().getEntityCollectionFrequency());
             } catch (Exception e) {
                 BukkitOfUtils.getInstance().logWarning("An error occurred while ticking the entity cache.", e);
